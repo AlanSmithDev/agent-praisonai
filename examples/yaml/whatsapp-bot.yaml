@@ -1,0 +1,15 @@
+# PraisonAI WhatsApp Bot Configuration (Zero-Code)
+# Start with: praisonai bot start --config whatsapp-bot.yaml
+
+platform: whatsapp
+<REDACTED_SECRET>
+phone_number_id: "${WHATSAPP_PHONE_NUMBER_ID}"
+verify_<REDACTED_SECRET>
+webhook_port: 8080
+
+agent:
+  name: "WhatsApp Assistant"
+  instructions: "You are a friendly assistant on WhatsApp. Keep responses concise."
+  llm: "gpt-4o-mini"
+  memory: true
+  web_search: true
