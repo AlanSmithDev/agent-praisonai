@@ -1,0 +1,1552 @@
+"""
+PraisonAIDB adapter - implements the DbAdapter protocol from praisonaiagents.
+
+This is the single owner of the "agent lifecycle -> conversation/state/knowledge
+store" hooks for the wrapper. It is the live path core routes to via
+``MemoryConfig(db=PraisonAIDB(...))`` (see ``praisonaiagents/db/__init__.py``).
+
+``PersistenceOrchestrator`` (``persistence/orchestrator.py``) is a thin,
+higher-level façade that delegates its message-write and session-end hooks to an
+instance of this adapter (built through :meth:`PraisonAIDB._from_stores`) so the
+store-write logic lives here in one place instead of being duplicated.
+"""
+
+import asyncio
+import inspect
+import time
+import logging
+import threading
+import weakref
+import concurrent.futures
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class PraisonAIDB:
+    """
+    Universal database adapter for PraisonAI agents.
+    
+    Automatically selects backends based on URL or explicit configuration.
+    Implements the DbAdapter protocol expected by praisonaiagents.Agent.
+    
+    Example:
+        from praisonaiagents import Agent, MemoryConfig
+        from praisonai.db import PraisonAIDB
+
+        # Simple usage with PostgreSQL
+        db = PraisonAIDB(database_url="postgresql://localhost/mydb")
+        agent = Agent(
+            name="Assistant",
+            memory=MemoryConfig(db=db, session_id="my-session"),
+        )
+        agent.chat("Hello!")
+        
+        # With multiple backends
+        db = PraisonAIDB(
+            database_url="postgresql://localhost/mydb",
+            state_url="redis://localhost:6379"
+        )
+    """
+    
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        state_url: Optional[str] = None,
+        knowledge_url: Optional[str] = None,
+        **options
+    ):
+        """
+        Initialize PraisonDB adapter.
+        
+        Args:
+            database_url: URL for conversation storage (postgres, mysql, sqlite)
+            state_url: URL for state storage (redis, etc.)
+            knowledge_url: URL for knowledge/vector storage (qdrant, etc.)
+            **options: Additional backend-specific options
+        """
+        self._database_url = database_url
+        self._state_url = state_url
+        self._knowledge_url = knowledge_url
+        # Pop adapter-level options before forwarding the rest to the backend
+        # store factories, so they are never passed through as backend kwargs.
+        init_retry_cooldown = options.pop("init_retry_cooldown", 30.0)
+        self._options = options
+        
+        # Lazy-loaded stores
+        self._conversation_store = None
+        self._state_store = None
+        self._knowledge_store = None
+        self._initialized = False
+        self._init_lock = threading.Lock()          # guards the sync init path
+        # Async callers do NOT cache an asyncio.Lock on the instance: such a lock
+        # binds to the loop that created it and raises when awaited from another
+        # (e.g. per-session scoped_bridge loops sharing one adapter). Instead the
+        # blocking store construction runs off-loop via asyncio.to_thread, where
+        # the sync _init_lock already serialises init. Kept as None for backward
+        # compatibility with any external references.
+        self._ainit_lock: Optional["asyncio.Lock"] = None
+        # Remember the last init failure so a soft error (bad config / missing
+        # dep / cloud auth failure) is surfaced cleanly instead of being re-tried
+        # — and re-raised — on every subsequent callback. The failure is NOT
+        # permanent: after a short cool-down a later callback re-attempts
+        # construction, so persistence transparently recovers once a transient
+        # DB/network outage clears, while a down backend is not hammered on
+        # every call in between.
+        self._init_failed: Optional[Exception] = None
+        self._init_failed_at: float = 0.0
+        # Seconds to suppress retries after an init failure before re-attempting.
+        self._init_retry_cooldown: float = float(init_retry_cooldown)
+        # Per-instance fire-and-forget write tracking so a tenant's close()
+        # flushes only ITS OWN in-flight writes: a process-global set would make
+        # one tenant's close() wait on (and spend its flush budget on) another
+        # tenant's stuck writes. A WeakSet lets completed futures be GC'd.
+        self._bg_writes: "weakref.WeakSet[concurrent.futures.Future]" = weakref.WeakSet()
+        self._bg_writes_lock = threading.Lock()
+
+    @classmethod
+    def _from_stores(
+        cls,
+        conversation_store: Any = None,
+        state_store: Any = None,
+        knowledge_store: Any = None,
+    ) -> "PraisonAIDB":
+        """Build an adapter around already-constructed store instances.
+
+        Used by :class:`~praisonai.persistence.orchestrator.PersistenceOrchestrator`
+        so it can reuse this adapter's lifecycle-hook + dispatch logic without
+        re-parsing URLs or re-building stores. The stores are treated as fully
+        initialised, so the lazy URL-based construction path is bypassed.
+        """
+        self = cls.__new__(cls)
+        self._database_url = None
+        self._state_url = None
+        self._knowledge_url = None
+        self._options = {}
+        self._conversation_store = conversation_store
+        self._state_store = state_store
+        self._knowledge_store = knowledge_store
+        self._initialized = True
+        self._init_lock = threading.Lock()
+        self._ainit_lock = None
+        self._init_failed = None
+        self._init_failed_at = 0.0
+        self._init_retry_cooldown = 30.0
+        self._bg_writes = weakref.WeakSet()
+        self._bg_writes_lock = threading.Lock()
+        return self
+
+    def _build_stores(self):
+        """Construct the backing stores (blocking I/O). Caller handles locking."""
+        # Import persistence layer
+        from ..persistence.factory import (
+            create_conversation_store,
+            create_state_store,
+            create_knowledge_store,
+        )
+
+        # Initialize conversation store
+        if self._database_url:
+            backend = self._detect_backend(self._database_url)
+            self._conversation_store = create_conversation_store(
+                backend, url=self._database_url, **self._options
+            )
+
+        # Initialize state store
+        if self._state_url:
+            backend = self._detect_backend(self._state_url)
+            self._state_store = create_state_store(
+                backend, url=self._state_url, **self._options
+            )
+
+        # Initialize knowledge store
+        if self._knowledge_url:
+            backend = self._detect_backend(self._knowledge_url)
+            self._knowledge_store = create_knowledge_store(
+                backend, url=self._knowledge_url, **self._options
+            )
+
+    # DBAPI/driver exception class names that indicate a *transient* connection
+    # or availability failure (network down, backend unreachable, pool
+    # exhausted) rather than a fatal misconfiguration. These drivers (psycopg2,
+    # pymysql, redis, etc.) are optional deps, so we match by class name across
+    # the MRO instead of importing them here — keeping the optional-dependency
+    # boundary intact while still memoizing genuine outages for the cool-down.
+    _TRANSIENT_INIT_ERROR_NAMES = frozenset(
+        {
+            "OperationalError",
+            "InterfaceError",
+            "ConnectionError",
+            "PoolError",
+            "PoolTimeout",
+            "TimeoutError",
+        }
+    )
+
+    @classmethod
+    def _is_transient_init_error(cls, exc: BaseException) -> bool:
+        """Return True if ``exc`` is a transient (retryable) init failure.
+
+        Built-in transient errors are matched by type; driver-specific DBAPI
+        errors (e.g. ``psycopg2.OperationalError``) are matched by class name
+        across the exception's MRO so optional drivers need not be imported.
+
+        ``PermissionError`` is deliberately excluded: it is an ``OSError``
+        subclass but represents a fatal misconfiguration (bad credentials, wrong
+        file mode) that must surface immediately on every call rather than being
+        suppressed for the whole cooldown window.
+        """
+        if isinstance(exc, PermissionError):
+            return False
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return True
+        for klass in type(exc).__mro__:
+            if klass.__name__ in cls._TRANSIENT_INIT_ERROR_NAMES:
+                return True
+        return False
+
+    def _init_failure_active(self) -> Optional[Exception]:
+        """Return the cached init failure if still within the cool-down window.
+
+        A failure older than ``_init_retry_cooldown`` seconds is cleared so the
+        next caller re-attempts construction — this lets persistence recover
+        automatically after a transient DB/network outage instead of staying
+        permanently disabled for the adapter's lifetime.
+        """
+        if self._init_failed is None:
+            return None
+        if (time.monotonic() - self._init_failed_at) >= self._init_retry_cooldown:
+            self._init_failed = None
+            self._init_failed_at = 0.0
+            return None
+        return self._init_failed
+
+    def _init_stores(self):
+        """Lazily initialize stores on first use (sync path)."""
+        if self._initialized:
+            return
+        cached = self._init_failure_active()
+        if cached is not None:
+            raise cached
+
+        with self._init_lock:
+            if self._initialized:  # Double-check inside lock
+                return
+            cached = self._init_failure_active()
+            if cached is not None:
+                raise cached
+            try:
+                self._build_stores()
+                self._initialized = True
+                self._init_failed = None
+                self._init_failed_at = 0.0
+            except Exception as e:
+                # Only *transient* backend/network errors are memoized for a
+                # bounded cool-down window so a down backend is not hammered on
+                # every callback, while recovery is still possible (see
+                # _init_failure_active). This includes driver-specific DBAPI
+                # errors such as psycopg2.OperationalError, which are NOT
+                # subclasses of ConnectionError/OSError and would otherwise
+                # escape the cooldown (see _is_transient_init_error).
+                #
+                # Fatal misconfiguration (permission/typo/programming errors)
+                # is re-raised WITHOUT being memoized so it surfaces immediately
+                # on the next call rather than being suppressed for the whole
+                # cooldown window. KeyboardInterrupt/SystemExit and other
+                # BaseExceptions (e.g. CancelledError surfacing through
+                # to_thread) already bypass this handler and must NOT poison
+                # _init_failed.
+                if self._is_transient_init_error(e):
+                    self._init_failed = e
+                    self._init_failed_at = time.monotonic()
+                raise
+
+    async def _ainit_stores(self):
+        """Lazily initialize stores on first use (async path).
+
+        Never holds a threading.Lock on the event-loop thread. The blocking
+        store construction is delegated to the same locked sync initializer
+        (``_init_stores``) via :func:`asyncio.to_thread`, so the sync and async
+        paths share a single ``_init_lock`` and can never construct stores
+        concurrently on the same adapter instance.
+        """
+        if self._initialized:
+            return
+        cached = self._init_failure_active()
+        if cached is not None:
+            raise cached
+
+        # Do not cache an asyncio.Lock on the instance: a lock created on one
+        # loop raises RuntimeError when awaited from another (e.g. per-session
+        # scoped_bridge loops sharing one PraisonAIDB). Blocking store
+        # construction is already serialised on the sync _init_lock inside
+        # _init_stores, which runs off the loop via asyncio.to_thread, so async
+        # callers on any loop can never construct stores concurrently.
+        await asyncio.to_thread(self._init_stores)
+    
+    def _detect_backend(self, url: str) -> str:
+        """Detect backend type from URL.
+        
+        Supports cloud-native serverless providers:
+        - Neon (*.neon.tech) -> postgres
+        - CockroachDB (*.cockroachlabs.cloud) -> postgres
+        - Xata (*.xata.sh) -> postgres
+        - Supabase direct Postgres (*.supabase.com port 5432/6543) -> postgres
+        - Supabase REST (*.supabase.co via HTTPS) -> supabase
+        - Turso/libSQL (libsql://) -> turso
+        """
+        url_lower = url.lower()
+        
+        # Turso/libSQL — unique scheme
+        if url_lower.startswith("libsql://"):
+            return "turso"
+        
+        # PostgreSQL-compatible (including cloud providers)
+        if url_lower.startswith("postgresql://") or url_lower.startswith("postgres://"):
+            return "postgres"
+        elif url_lower.startswith("mysql://"):
+            return "mysql"
+        elif url_lower.startswith("sqlite://") or url_lower.endswith(".db"):
+            return "sqlite"
+        elif url_lower.startswith("redis://"):
+            return "redis"
+        elif url_lower.startswith("http://") or url_lower.startswith("https://"):
+            # Supabase REST API
+            if ".supabase.co" in url_lower or ".supabase.com" in url_lower:
+                return "supabase"
+            # Could be Qdrant, Weaviate, etc.
+            if "qdrant" in url_lower or ":6333" in url_lower:
+                return "qdrant"
+            elif "weaviate" in url_lower:
+                return "weaviate"
+            # Unable to infer - must fail loudly
+            raise ValueError(
+                f"Unable to infer DB backend from URL {url!r}; "
+                "use a recognised scheme (sqlite://, postgres://, redis://, etc.)"
+            )
+        
+        # Unknown scheme - fail loudly
+        raise ValueError(
+            f"Unable to infer DB backend from URL {url!r}; "
+            "supported schemes: postgres://, mysql://, sqlite://, redis://, libsql://, http(s)://"
+        )
+    
+    def on_agent_start(
+        self,
+        agent_name: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List:
+        """Called when agent starts - returns previous messages for resume."""
+        self._init_stores()
+        
+        if not self._conversation_store:
+            return []
+        
+        from ..persistence.conversation.base import ConversationSession
+        from ..persistence.conversation._ops import resume_or_create_session
+        
+        store = self._conversation_store
+        existing = self._call_store(
+            store, "get_session", "async_get_session", session_id
+        )
+        messages = resume_or_create_session(
+            store,
+            existing,
+            session_id,
+            build_session=lambda: ConversationSession(
+                session_id=session_id,
+                user_id=user_id or "default",
+                agent_id=agent_name,
+                name=f"Session {session_id}",
+                metadata=metadata or {},
+            ),
+            create_session=lambda s: self._call_store(
+                store, "create_session", "async_create_session", s
+            ),
+            get_messages=lambda: self._call_store(
+                store, "get_messages", "async_get_messages", session_id
+            ),
+        )
+        
+        if messages is None:
+            return []
+        
+        # Convert to DbMessage format. Carry the structured tool fields so a
+        # resumed tool-using session rebuilds the same transcript the model saw
+        # before (Issue #5075 — parity with the JSON store fix in #3089).
+        from praisonaiagents.db.protocol import DbMessage
+        return [
+            DbMessage(
+                role=msg.role,
+                content=msg.content,
+                metadata=msg.metadata or {},
+                timestamp=msg.created_at or time.time(),
+                id=msg.id,
+                tool_calls=getattr(msg, "tool_calls", None),
+                tool_call_id=getattr(msg, "tool_call_id", None),
+            )
+            for msg in messages
+        ]
+    
+    def on_user_message(
+        self,
+        session_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when user sends a message."""
+        self._init_stores()
+        if not self._conversation_store:
+            return
+        
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+        
+        msg = ConversationMessage(
+            id=f"msg-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="user",
+            content=content,
+            metadata=metadata or {},
+            created_at=time.time()
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+    
+    def on_agent_message(
+        self,
+        session_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when agent produces a response."""
+        self._init_stores()
+        if not self._conversation_store:
+            return
+        
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+        
+        msg = ConversationMessage(
+            id=f"msg-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="assistant",
+            content=content,
+            metadata=metadata or {},
+            created_at=time.time()
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+    
+    def on_assistant_message(
+        self,
+        session_id: str,
+        content: str,
+        tool_calls: Optional[List[Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist an assistant turn that requested tools (Issue #5075).
+
+        Stores the structured ``tool_calls`` verbatim on the
+        ``ConversationMessage`` so a resumed session replays the same
+        assistant turn the model produced. Falls back to a plain assistant
+        message when no tool calls are present.
+        """
+        self._init_stores()
+        if not self._conversation_store:
+            return
+
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+
+        msg = ConversationMessage(
+            id=f"msg-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="assistant",
+            content=content,
+            tool_calls=tool_calls,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+
+    def on_tool_message(
+        self,
+        session_id: str,
+        content: str,
+        tool_call_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist a tool result turn linked to its call id (Issue #5075).
+
+        Keeps the ``role="tool"`` result and its ``tool_call_id`` so the
+        resumed message list interleaves results in order, matching the JSON
+        store behaviour from #3089.
+        """
+        self._init_stores()
+        if not self._conversation_store:
+            return
+
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+
+        msg = ConversationMessage(
+            id=f"tool-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="tool",
+            content=content,
+            tool_call_id=tool_call_id,
+            metadata=metadata or {},
+            created_at=time.time(),
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+
+    @staticmethod
+    def _serialize_tool_call(tool_name: str, args: Any, result: Any) -> str:
+        """Serialise a tool call for persistence without dropping data.
+
+        A persistence layer's contract is preservation: the full tool result is
+        kept verbatim so an agent that resumes sees exactly what it did. Shared
+        by both the sync and async paths so they cannot drift.
+        """
+        import json
+        return json.dumps({
+            "tool": tool_name,
+            "args": args,
+            "result": str(result),
+        })
+
+    def on_tool_call(
+        self,
+        session_id: str,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a tool is executed."""
+        self._init_stores()
+        if not self._conversation_store:
+            return
+        
+        from ..persistence.conversation.base import ConversationMessage
+        import uuid
+        
+        tool_content = self._serialize_tool_call(tool_name, args, result)
+        
+        msg = ConversationMessage(
+            id=f"tool-{uuid.uuid4().hex[:12]}",
+            session_id=session_id,
+            role="tool",
+            content=tool_content,
+            metadata={"tool_name": tool_name, **(metadata or {})},
+            created_at=time.time()
+        )
+        self._call_store(
+            self._conversation_store,
+            "add_message",
+            "async_add_message",
+            session_id,
+            msg,
+        )
+    
+    def on_agent_end(
+        self,
+        session_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when agent session ends."""
+        self._init_stores()
+        if not self._conversation_store:
+            return
+
+        store = self._conversation_store
+
+        # Read-modify-write the session's ``ended_at`` as one coroutine so the
+        # ``get_session`` read never has to cross the loop boundary (which raises
+        # from inside a running loop and would silently drop the update). See
+        # #4945 — same failure mode as the state-store completion hooks.
+        async def _do():
+            session = await self._dispatch_async(
+                store, "get_session", "async_get_session", session_id
+            )
+            if not session:
+                return None
+            session.metadata = {**(session.metadata or {}), "ended_at": time.time()}
+            await self._dispatch_async(
+                store, "update_session", "async_update_session", session
+            )
+            return session
+
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        dispatch_maybe_awaitable(
+            _do(),
+            kind=DispatchKind.WRITE,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name="on_agent_end",
+        )
+    
+    def on_run_start(
+        self,
+        session_id: str,
+        run_id: str,
+        input_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a new run (turn) starts."""
+        self._init_stores()
+        # Store run start in state if available (even without conversation store)
+        if self._state_store:
+            run_key = f"run:{session_id}:{run_id}"
+            self._call_store(self._state_store, "set", "async_set", run_key, {
+                "run_id": run_id,
+                "session_id": session_id,
+                "started_at": time.time(),
+                "input_content": input_content,
+                "status": "running",
+                "metadata": metadata or {}
+            })
+    
+    def on_run_end(
+        self,
+        session_id: str,
+        run_id: str,
+        output_content: Optional[str] = None,
+        status: str = "completed",
+        metrics: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a run (turn) ends."""
+        self._init_stores()
+        if self._state_store:
+            run_key = f"run:{session_id}:{run_id}"
+            self._merge_and_set(self._state_store, run_key, {
+                "ended_at": time.time(),
+                "output_content": output_content,
+                "status": status,
+                "metrics": metrics or {},
+                "metadata": metadata or {},
+            })
+    
+    def get_runs(
+        self,
+        session_id: str,
+        limit: Optional[int] = None,
+    ) -> List:
+        """Return persisted runs for a session, newest first."""
+        self._init_stores()
+        if not self._state_store:
+            logger.warning("get_runs() called but no state_url configured; returning []")
+            return []
+
+        prefix = f"run:{session_id}:"
+        # State stores expose scan_prefix() per the protocol; fall back to keys() for legacy.
+        if hasattr(self._state_store, "scan_prefix"):
+            keys = self._state_store.scan_prefix(prefix)
+        else:
+            keys = [k for k in self._state_store.keys() if k.startswith(prefix)]
+        
+        runs = []
+        for k in keys:
+            try:
+                run_data = self._state_store.get(k)
+            except Exception as exc:
+                logger.warning("Failed to load run key '%s': %s", k, exc)
+                continue
+            if isinstance(run_data, dict):
+                runs.append(run_data)
+        
+        runs.sort(key=lambda r: r.get("started_at", 0), reverse=True)
+        if limit is not None:
+            return runs[: max(limit, 0)]
+        return runs
+    
+    def export_session(
+        self,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Export a session as a dictionary."""
+        self._init_stores()
+        
+        if not self._conversation_store:
+            return {}
+        
+        session = self._conversation_store.get_session(session_id)
+        if not session:
+            return {}
+        
+        messages = self._conversation_store.get_messages(session_id)
+        
+        return {
+            "session_id": session.session_id,
+            "user_id": session.user_id,
+            "agent_id": session.agent_id,
+            "name": session.name,
+            "metadata": session.metadata,
+            "created_at": session.created_at,
+            "messages": [
+                {
+                    "id": msg.id,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "metadata": msg.metadata,
+                    "created_at": msg.created_at
+                }
+                for msg in messages
+            ]
+        }
+    
+    def import_session(
+        self,
+        data: Dict[str, Any],
+    ) -> str:
+        """Import a session from a dictionary."""
+        self._init_stores()
+        
+        if not self._conversation_store:
+            raise ValueError("No conversation store configured")
+        
+        from ..persistence.conversation.base import ConversationSession, ConversationMessage
+        import uuid
+        
+        session_id = data.get("session_id") or f"imported-{uuid.uuid4().hex[:8]}"
+        
+        # Create session
+        session = ConversationSession(
+            session_id=session_id,
+            user_id=data.get("user_id", "default"),
+            agent_id=data.get("agent_id", "imported"),
+            name=data.get("name", f"Imported Session {session_id}"),
+            metadata=data.get("metadata", {})
+        )
+        self._call_store(
+            self._conversation_store,
+            "create_session",
+            "async_create_session",
+            session,
+        )
+        
+        # Import messages with new IDs to avoid conflicts
+        for msg_data in data.get("messages", []):
+            msg = ConversationMessage(
+                id=f"msg-{uuid.uuid4().hex[:12]}",  # Always generate new ID
+                session_id=session_id,
+                role=msg_data.get("role", "user"),
+                content=msg_data.get("content", ""),
+                metadata=msg_data.get("metadata", {}),
+                created_at=msg_data.get("created_at", time.time())
+            )
+            self._call_store(
+                self._conversation_store,
+                "add_message",
+                "async_add_message",
+                session_id,
+                msg,
+            )
+        
+        return session_id
+    
+    # --- Tracing/Observability ---
+    
+    def on_trace_start(
+        self,
+        trace_id: str,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a new trace starts."""
+        self._init_stores()
+        if self._state_store:
+            trace_key = f"trace:{trace_id}"
+            self._call_store(self._state_store, "set", "async_set", trace_key, {
+                "trace_id": trace_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "agent_name": agent_name,
+                "user_id": user_id,
+                "started_at": time.time(),
+                "status": "running",
+                "spans": [],
+                "metadata": metadata or {}
+            })
+    
+    def on_trace_end(
+        self,
+        trace_id: str,
+        status: str = "ok",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a trace ends."""
+        self._init_stores()
+        if self._state_store:
+            trace_key = f"trace:{trace_id}"
+            self._merge_and_set(self._state_store, trace_key, {
+                "ended_at": time.time(),
+                "status": status,
+                "metadata": metadata or {},
+            })
+    
+    def on_span_start(
+        self,
+        span_id: str,
+        trace_id: str,
+        name: str,
+        parent_span_id: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a new span starts."""
+        self._init_stores()
+        if self._state_store:
+            span_key = f"span:{span_id}"
+            self._call_store(self._state_store, "set", "async_set", span_key, {
+                "span_id": span_id,
+                "trace_id": trace_id,
+                "name": name,
+                "parent_span_id": parent_span_id,
+                "started_at": time.time(),
+                "status": "running",
+                "attributes": attributes or {},
+                "events": []
+            })
+    
+    def on_span_end(
+        self,
+        span_id: str,
+        status: str = "ok",
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Called when a span ends."""
+        self._init_stores()
+        if self._state_store:
+            span_key = f"span:{span_id}"
+            self._merge_and_set(self._state_store, span_key, {
+                "ended_at": time.time(),
+                "status": status,
+                "attributes": attributes or {},
+            }, merge_keys=("attributes",))
+    
+    def get_traces(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List:
+        """Return persisted traces, optionally filtered by session/user."""
+        self._init_stores()
+        if not self._state_store:
+            logger.warning("get_traces() called but no state_url configured; returning []")
+            return []
+
+        prefix = "trace:"
+        if hasattr(self._state_store, "scan_prefix"):
+            keys = self._state_store.scan_prefix(prefix)
+        else:
+            keys = [k for k in self._state_store.keys() if k.startswith(prefix)]
+        
+        traces = []
+        for k in keys:
+            try:
+                trace_data = self._state_store.get(k)
+            except Exception as exc:
+                logger.warning("Failed to load trace key '%s': %s", k, exc)
+                continue
+            if isinstance(trace_data, dict):
+                traces.append(trace_data)
+        
+        if session_id is not None:
+            traces = [t for t in traces if t.get("session_id") == session_id]
+        if user_id is not None:
+            traces = [t for t in traces if t.get("user_id") == user_id]
+        traces.sort(key=lambda t: t.get("started_at", 0), reverse=True)
+        if limit is not None:
+            return traces[: max(limit, 0)]
+        return traces
+    
+    # ========================================================================
+    # Async Surface for async-safe agents
+    # ========================================================================
+
+    @staticmethod
+    def _store_callable(store, sync_name, async_name):
+        """Select a real async method when declared, else the sync surface.
+
+        ``Mock`` and some dynamic proxies fabricate arbitrary attributes from
+        ``getattr``. Static inspection prevents a fabricated ``async_*`` method
+        from shadowing the store's actual sync protocol method.
+        """
+        try:
+            inspect.getattr_static(store, async_name)
+        except AttributeError:
+            async_fn = None
+        else:
+            async_fn = getattr(store, async_name, None)
+        return async_fn or getattr(store, sync_name, None)
+
+    #: Store ops whose result the caller *reads back* before writing again.
+    #: These MUST return their real value — fire-and-forget would silently drop
+    #: the read: a resumed session would look empty (``get_session`` /
+    #: ``get_messages`` / ``list_sessions``), and the run/trace/span completion
+    #: hooks — which read-modify-write state via ``get`` then ``set`` — would
+    #: merge into an empty ``{}`` and overwrite the persisted record, losing
+    #: identifiers, start timestamps, input, spans, and events. Everything else
+    #: is a write, which is uuid-keyed and idempotent and safe to defer.
+    _READ_OPS = frozenset({"get", "get_session", "get_messages", "list_sessions"})
+
+    def _merge_and_set(self, store, key, patch, merge_keys=("metadata",)):
+        """Atomic read-modify-write of a state-store record from a sync hook.
+
+        The completion hooks (``on_run_end``/``on_agent_end``/``on_trace_end``/
+        ``on_span_end``) previously did ``get`` then ``set`` through two separate
+        :meth:`_call_store` calls. Inside a running event loop the ``get`` half
+        hits ``_READ_OPS`` and raises (``run_sync_or_offload`` refuses to block a
+        loop), the exception is swallowed by the core caller, and the ``set``
+        never runs — the record stays ``status="running"`` forever. See #4945.
+
+        Running the whole get+merge+set as ONE coroutine keeps the read off the
+        loop boundary, so the write half always executes. The merge is uuid-keyed
+        and idempotent, so deferring it as a tracked fire-and-forget write inside
+        a loop is safe by construction — identical to every other completion
+        write in :meth:`_call_store`.
+        """
+
+        async def _do():
+            current = await self._dispatch_async(store, "get", "async_get", key) or {}
+            merged = dict(current)
+            for mk in merge_keys:
+                if mk in patch:
+                    merged[mk] = {**(current.get(mk) or {}), **(patch[mk] or {})}
+            for pk, pv in patch.items():
+                if pk in merge_keys:
+                    continue
+                merged[pk] = pv
+            await self._dispatch_async(store, "set", "async_set", key, merged)
+            return merged
+
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        return dispatch_maybe_awaitable(
+            _do(),
+            kind=DispatchKind.WRITE,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name=f"merge_and_set:{key}",
+        )
+
+    def _call_store(self, store, sync_name, async_name, *args, **kwargs):
+        """Call a store from a sync hook without ever blocking or losing data.
+
+        A sync hook can be reached from a plain sync caller *or* from inside a
+        running event loop (several async chat paths still route through the
+        sync ``_persist_message``). When the resolved store method returns a
+        coroutine we must handle both:
+
+        - No running loop: block on the shared bridge via ``run_sync``.
+        - Running loop:
+
+          * **Writes** (default): submitting-then-blocking would park the loop
+            (the pathology ``run_sync_or_offload`` forbids), so we submit to the
+            shared bridge as tracked fire-and-forget. Store writes are uuid-keyed
+            and idempotent per message, so completing them slightly later is safe
+            by construction and strictly better than losing them.
+          * **Reads** (``get``/``get_session``/``get_messages``/…): the caller
+            consumes the return value — either directly (session/message loads)
+            or as the base of a read-modify-write (the run/trace/span completion
+            hooks ``get`` then ``set``). Fire-and-forget would silently drop the
+            read: a resumed session would look empty, and a completion hook would
+            merge into ``{}`` and overwrite the persisted record. We route these
+            through ``run_sync_or_offload``, which returns the value on a sync
+            path and, inside a running loop, fails loudly (steering callers to
+            the ``aon_*`` hooks) instead of corrupting state with a silent
+            ``None``.
+        """
+        fn = PraisonAIDB._store_callable(store, sync_name, async_name)
+        if fn is None:
+            return None
+
+        from .._async_bridge import DispatchKind, dispatch_maybe_awaitable
+
+        kind = (
+            DispatchKind.READ
+            if sync_name in PraisonAIDB._READ_OPS
+            else DispatchKind.WRITE
+        )
+        return dispatch_maybe_awaitable(
+            fn(*args, **kwargs),
+            kind=kind,
+            tracker=self._bg_writes,
+            tracker_lock=self._bg_writes_lock,
+            op_name=sync_name,
+        )
+
+    def flush_pending_writes(self, timeout: Optional[float] = 5.0) -> None:
+        """Give this adapter's in-flight fire-and-forget writes a chance to complete.
+
+        Called from :meth:`close`/:meth:`aclose` so a shutting-down worker does
+        not exit mid-write. Tracking is per-instance, so one tenant's close()
+        waits only on ITS OWN writes and never spends its flush budget on
+        another tenant's stuck future. Best-effort: never raises on a
+        slow/failed write.
+        """
+        with self._bg_writes_lock:
+            pending = [f for f in self._bg_writes if not f.done()]
+        if not pending:
+            return
+        try:
+            concurrent.futures.wait(pending, timeout=timeout)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("flush_pending_writes wait interrupted", exc_info=True)
+
+    @staticmethod
+    async def _dispatch_async(store, sync_name, async_name, *args, **kwargs):
+        """Dispatch a store call in an async-safe way.
+
+        Prefers a dedicated async method (``async_name``). Falls back to the
+        sync method (``sync_name``): if it is actually a coroutine function it
+        is awaited directly, otherwise it is off-loaded to a thread so the event
+        loop is never blocked. Returns ``None`` when neither method exists.
+        """
+        fn = PraisonAIDB._store_callable(store, sync_name, async_name)
+        if fn is None:
+            return None
+        if inspect.iscoroutinefunction(fn):
+            return await fn(*args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def aon_agent_start(
+        self,
+        agent_name: str,
+        session_id: str,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List:
+        """Async version of on_agent_start - returns previous messages for resume.
+
+        Signature matches ``AsyncDbAdapter.on_agent_start`` so the async surface
+        stays protocol-aligned and ``user_id`` is persisted rather than dropped.
+        """
+        await self._ainit_stores()
+
+        messages: List = []
+
+        if self._conversation_store:
+            from ..persistence.conversation.base import ConversationSession
+            from ..persistence.conversation._ops import aresume_or_create_session
+
+            store = self._conversation_store
+            session = await self._dispatch_async(
+                store, "get_session", "async_get_session", session_id
+            )
+
+            raw = await aresume_or_create_session(
+                store,
+                session,
+                session_id,
+                build_session=lambda: ConversationSession(
+                    session_id=session_id,
+                    user_id=user_id or "default",
+                    agent_id=agent_name,
+                    name=f"Session {session_id}",
+                    metadata=metadata or {},
+                ),
+                create_session=lambda s: self._dispatch_async(
+                    store, "create_session", "async_create_session", s
+                ),
+                get_messages=lambda: self._dispatch_async(
+                    store, "get_messages", "async_get_messages", session_id
+                ),
+            )
+
+            if raw is not None:
+                from praisonaiagents.db.protocol import DbMessage
+
+                messages = [
+                    DbMessage(
+                        role=m.role,
+                        content=m.content,
+                        metadata=m.metadata or {},
+                        timestamp=m.created_at or time.time(),
+                        id=m.id,
+                    )
+                    for m in (raw or [])
+                ]
+
+        if self._state_store:
+            # Keyed by session only (not agent_name) so aon_agent_end — whose
+            # protocol signature carries just session_id — updates the SAME
+            # lifecycle record instead of leaving this one stuck at "started".
+            await self._dispatch_async(
+                self._state_store,
+                "set",
+                "async_set",
+                f"agent:{session_id}",
+                {
+                    "agent_name": agent_name,
+                    "status": "started",
+                    "metadata": metadata or {},
+                },
+            )
+
+        return messages
+
+    async def aon_user_message(
+        self,
+        session_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Async version of on_user_message."""
+        await self._ainit_stores()
+        
+        if self._conversation_store:
+            from ..persistence.conversation.base import ConversationMessage
+            import uuid
+            msg = ConversationMessage(
+                id=f"msg-{uuid.uuid4().hex[:12]}",
+                session_id=session_id,
+                role="user",
+                content=content,
+                metadata=metadata or {},
+                created_at=time.time(),
+            )
+
+            await self._dispatch_async(
+                self._conversation_store,
+                "add_message",
+                "async_add_message",
+                session_id,
+                msg,
+            )
+
+    async def aon_agent_message(
+        self,
+        session_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Async version of on_agent_message."""
+        await self._ainit_stores()
+        
+        if self._conversation_store:
+            from ..persistence.conversation.base import ConversationMessage
+            import uuid
+            msg = ConversationMessage(
+                id=f"msg-{uuid.uuid4().hex[:12]}",
+                session_id=session_id,
+                role="assistant",
+                content=content,
+                metadata=metadata or {},
+                created_at=time.time(),
+            )
+
+            await self._dispatch_async(
+                self._conversation_store,
+                "add_message",
+                "async_add_message",
+                session_id,
+                msg,
+            )
+
+    async def aon_tool_call(
+        self,
+        session_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: Any = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Async version of on_tool_call."""
+        await self._ainit_stores()
+        
+        if self._conversation_store:
+            if hasattr(self._conversation_store, "async_add_tool_call") or hasattr(
+                self._conversation_store, "add_tool_call"
+            ):
+                await self._dispatch_async(
+                    self._conversation_store,
+                    "add_tool_call",
+                    "async_add_tool_call",
+                    session_id,
+                    tool_name,
+                    arguments,
+                    result,
+                    metadata,
+                )
+            else:
+                # Fall back to persisting the tool call as a message so the
+                # async path matches the sync on_tool_call behaviour.
+                from ..persistence.conversation.base import ConversationMessage
+                import uuid
+
+                tool_content = self._serialize_tool_call(tool_name, arguments, result)
+                msg = ConversationMessage(
+                    id=f"tool-{uuid.uuid4().hex[:12]}",
+                    session_id=session_id,
+                    role="tool",
+                    content=tool_content,
+                    metadata={"tool_name": tool_name, **(metadata or {})},
+                    created_at=time.time(),
+                )
+                await self._dispatch_async(
+                    self._conversation_store,
+                    "add_message",
+                    "async_add_message",
+                    session_id,
+                    msg,
+                )
+
+    async def aon_agent_end(
+        self,
+        session_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Async version of on_agent_end.
+
+        Signature matches ``AsyncDbAdapter.on_agent_end``.
+        """
+        await self._ainit_stores()
+
+        if self._conversation_store:
+            session = await self._dispatch_async(
+                self._conversation_store,
+                "get_session",
+                "async_get_session",
+                session_id,
+            )
+            if session:
+                session.metadata = {**(session.metadata or {}), "ended_at": time.time()}
+                await self._dispatch_async(
+                    self._conversation_store,
+                    "update_session",
+                    "async_update_session",
+                    session,
+                )
+
+        if self._state_store:
+            # Update the record aon_agent_start wrote under the same key so the
+            # completion transition preserves agent_name/started_at context
+            # instead of overwriting it with a disconnected "ended" record.
+            agent_key = f"agent:{session_id}"
+            agent_data = await self._dispatch_async(
+                self._state_store, "get", "async_get", agent_key
+            ) or {}
+            agent_data.update({
+                "status": "ended",
+                "ended_at": time.time(),
+                "metadata": {**agent_data.get("metadata", {}), **(metadata or {})},
+            })
+            await self._dispatch_async(
+                self._state_store, "set", "async_set", agent_key, agent_data
+            )
+
+    async def aon_run_start(
+        self,
+        session_id: str,
+        run_id: str,
+        input_content: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Async version of on_run_start - persists run/turn tracking."""
+        await self._ainit_stores()
+
+        if self._state_store:
+            run_key = f"run:{session_id}:{run_id}"
+            await self._dispatch_async(
+                self._state_store,
+                "set",
+                "async_set",
+                run_key,
+                {
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "started_at": time.time(),
+                    "input_content": input_content,
+                    "status": "running",
+                    "metadata": metadata or {},
+                },
+            )
+
+    async def aon_run_end(
+        self,
+        session_id: str,
+        run_id: str,
+        output_content: Optional[str] = None,
+        status: str = "completed",
+        metrics: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Async version of on_run_end - persists run/turn tracking."""
+        await self._ainit_stores()
+
+        if self._state_store:
+            run_key = f"run:{session_id}:{run_id}"
+            run_data = await self._dispatch_async(
+                self._state_store, "get", "async_get", run_key
+            ) or {}
+            run_data.update({
+                "ended_at": time.time(),
+                "output_content": output_content,
+                "status": status,
+                "metrics": metrics or {},
+                "metadata": {**run_data.get("metadata", {}), **(metadata or {})},
+            })
+            await self._dispatch_async(
+                self._state_store, "set", "async_set", run_key, run_data
+            )
+
+    async def aclose(self) -> None:
+        """Async version of close; idempotent and lock-safe.
+
+        Resets lifecycle state under the shared sync ``_init_lock`` (off the
+        event loop) so init/close can never race and leave a half-closed adapter
+        that reports ``_initialized`` while its stores are shut. No instance-
+        cached asyncio.Lock is used, so a shared adapter is safe to close from a
+        different loop than the one that initialised it (e.g. scoped_bridge).
+        """
+        # Flush any fire-and-forget writes submitted from a running loop before
+        # tearing stores down, so a shutting-down worker does not drop in-flight
+        # persistence. Runs off the event loop to avoid blocking it.
+        await asyncio.to_thread(self.flush_pending_writes)
+
+        def _snapshot_and_reset():
+            with self._init_lock:
+                snapshot = (
+                    self._conversation_store,
+                    self._state_store,
+                    self._knowledge_store,
+                )
+                self._conversation_store = None
+                self._state_store = None
+                self._knowledge_store = None
+                self._initialized = False
+                self._init_failed = None
+                self._init_failed_at = 0.0
+                return snapshot
+
+        stores = await asyncio.to_thread(_snapshot_and_reset)
+
+        for store in stores:
+            if store is None:
+                continue
+            if hasattr(store, "async_close"):
+                try:
+                    await store.async_close()
+                except Exception:
+                    logger.exception("Error async-closing store %r", store)
+            else:
+                try:
+                    await asyncio.to_thread(store.close)
+                except Exception:
+                    logger.exception("Error closing store %r", store)
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        await self._ainit_stores()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        await self.aclose()
+
+    def __enter__(self):
+        """Sync context manager entry."""
+        self._init_stores()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Sync context manager exit."""
+        self.close()
+    
+    def close(self) -> None:
+        """Close all database connections; idempotent and lock-safe.
+
+        Resets lifecycle state under ``_init_lock`` so a subsequent hook (or a
+        reused ``with db: ...`` block) triggers a clean re-initialisation via
+        ``_init_stores()`` instead of dispatching to a closed store.
+        """
+        # Flush fire-and-forget writes submitted from a running loop before
+        # tearing stores down so shutdown does not drop in-flight persistence.
+        self.flush_pending_writes()
+        with self._init_lock:
+            stores = (
+                self._conversation_store,
+                self._state_store,
+                self._knowledge_store,
+            )
+            self._conversation_store = None
+            self._state_store = None
+            self._knowledge_store = None
+            self._initialized = False
+            self._init_failed = None
+            self._init_failed_at = 0.0
+        for store in stores:
+            if store is None:
+                continue
+            try:
+                store.close()
+            except Exception:
+                logger.exception("Error closing store %r", store)
+
+
+class PostgresDB(PraisonAIDB):
+    """PostgreSQL-specific database adapter."""
+    
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5432,
+        database: str = "praisonai",
+        user: str = "postgres",
+        password: str = "",
+        **options
+    ):
+        from urllib.parse import quote_plus
+        url = (
+            f"postgresql://{quote_plus(user)}:{quote_plus(password)}"
+            f"@{host}:{port}/{database}"
+        )
+        super().__init__(database_url=url, **options)
+
+
+class SQLiteDB(PraisonAIDB):
+    """SQLite-specific database adapter."""
+    
+    def __init__(self, path: str = "praisonai.db", database_url: str = None, **options):
+        # Allow either path or database_url
+        url = database_url or path
+        super().__init__(database_url=url, **options)
+    
+    def _detect_backend(self, url: str) -> str:
+        return "sqlite"
+
+
+class RedisDB(PraisonAIDB):
+    """Redis-specific database adapter (for state only)."""
+    
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6379,
+        **options
+    ):
+        url = f"redis://{host}:{port}"
+        super().__init__(state_url=url, **options)
+
+
+class NeonDB(PraisonAIDB):
+    """Neon serverless PostgreSQL adapter.
+    
+    Auto-configures SSL, retry logic, and connection timeout for Neon's
+    scale-to-zero architecture.
+    
+    Example:
+        db = NeonDB(database_url="postgresql://user:pass@ep-xxx.neon.tech/mydb")
+    """
+    
+    def __init__(self, database_url: Optional[str] = None, **options):
+        import os
+        url = database_url or os.getenv("NEON_DATABASE_URL")
+        if not url:
+            raise ValueError(
+                "Neon database URL required. Provide database_url or set NEON_DATABASE_URL."
+            )
+        super().__init__(database_url=url, **options)
+
+
+class CockroachDB(PraisonAIDB):
+    """CockroachDB Serverless adapter.
+    
+    Auto-configures SSL, retry logic (including serialization error 40001),
+    and connection timeout.
+    
+    Example:
+        db = CockroachDB(database_url="postgresql://user:pass@xxx.cockroachlabs.cloud:26257/mydb")
+    """
+    
+    def __init__(self, database_url: Optional[str] = None, **options):
+        import os
+        url = database_url or os.getenv("COCKROACHDB_URL")
+        if not url:
+            raise ValueError(
+                "CockroachDB URL required. Provide database_url or set COCKROACHDB_URL."
+            )
+        super().__init__(database_url=url, **options)
+
+
+class XataDB(PraisonAIDB):
+    """Xata serverless PostgreSQL adapter.
+    
+    Example:
+        db = XataDB(database_url="postgresql://user:pass@xxx.xata.sh:5432/mydb")
+    """
+    
+    def __init__(self, database_url: Optional[str] = None, **options):
+        import os
+        url = database_url or os.getenv("XATA_DATABASE_URL")
+        if not url:
+            raise ValueError(
+                "Xata database URL required. Provide database_url or set XATA_DATABASE_URL."
+            )
+        super().__init__(database_url=url, **options)
+
+
+class TursoDB(PraisonAIDB):
+    """Turso/libSQL database adapter.
+    
+    Uses the libsql Python driver for Turso's SQLite-compatible edge database.
+    
+    Example:
+        db = TursoDB(
+            database_url="libsql://mydb-user.turso.io",
+            turso_auth_<REDACTED_SECRET>
+        )
+    """
+    
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        turso_auth_token: Optional[str] = None,
+        **options
+    ):
+        import os
+        url = database_url or os.getenv("TURSO_DATABASE_URL")
+        token = turso_auth_token or os.getenv("TURSO_AUTH_TOKEN")
+        if not url:
+            raise ValueError(
+                "Turso database URL required. Provide database_url or set TURSO_DATABASE_URL."
+            )
+        options["auth_token"] = token
+        super().__init__(database_url=url, **options)
+
+
+# Backward-compatible aliases
+PraisonDB = PraisonAIDB
+DB = PraisonAIDB
