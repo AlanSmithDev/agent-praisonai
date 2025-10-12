@@ -1,0 +1,164 @@
+"""Tests for remaining security hardening (round 2)."""
+
+import os
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_launch_token(monkeypatch):
+    """No launch token, and no generated one, before each test in this file.
+
+    resolve_launch_host() writes PRAISONAI_LAUNCH_AUTH_TOKEN into os.environ
+    DIRECTLY (not via monkeypatch) when it mints a token for a non-loopback
+    bind, and caches it in the module global _GENERATED_TOKEN. Depending on the
+    order these tests run in, that token was still set when
+    test_launch_auth_optional_by_default asked whether auth is optional by
+    default -- and it is not, once a token exists. Failed under a random seed,
+    passed in collection order.
+
+    A test about the DEFAULT has to establish the default rather than inherit it.
+    """
+    import praisonaiagents.agent.launch_security as ls
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(ls, "_GENERATED_TOKEN", None, raising=False)
+    yield
+    os.environ.pop("PRAISONAI_LAUNCH_AUTH_TOKEN", None)
+
+
+def test_launch_auth_optional_by_default():
+    from praisonaiagents.agents.agents import _authorise_launch_request
+
+    class Req:
+        headers = {}
+
+    assert _authorise_launch_request(Req()) is True
+
+
+def test_launch_auth_enforced_when_token_set(monkeypatch):
+    from praisonaiagents.agents.agents import _authorise_launch_request
+
+    monkeypatch.setenv("PRAISONAI_LAUNCH_AUTH_TOKEN", "secret")
+
+    class Bad:
+        headers = {}
+
+    class Good:
+        headers = {"Authorization": "Bearer secret"}
+
+    assert _authorise_launch_request(Bad()) is False
+    assert _authorise_launch_request(Good()) is True
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+
+
+def test_launch_authoriser_parity_single_and_multi_agent():
+    """Both launch paths must use the same request authoriser (issue #4083)."""
+    from praisonaiagents.agents.agents import _authorise_launch_request as multi
+    from praisonaiagents.agent.launch_security import authorise_launch_request as shared
+    from praisonaiagents.agent.execution_mixin import ExecutionMixin
+
+    # Multi-agent path re-exports the shared authoriser.
+    assert multi is shared
+    # Single-agent path imports the same authoriser lazily inside its launcher.
+    assert "authorise_launch_request" in ExecutionMixin._launch_http_server.__code__.co_names
+
+
+def test_launch_wrong_bearer_rejected(monkeypatch):
+    from praisonaiagents.agent.launch_security import authorise_launch_request
+
+    monkeypatch.setenv("PRAISONAI_LAUNCH_AUTH_TOKEN", "secret")
+
+    class Wrong:
+        headers = {"Authorization": "Bearer nope"}
+
+    class XAuthGood:
+        headers = {"X-Auth-Token": "secret"}
+
+    assert authorise_launch_request(Wrong()) is False
+    assert authorise_launch_request(XAuthGood()) is True
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+
+
+def test_bind_guard_loopback_keyless_allowed(monkeypatch):
+    from praisonaiagents.agent.launch_security import resolve_launch_host
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+    # Loopback keyless: unchanged, no token generated (dev flow preserved).
+    assert resolve_launch_host("127.0.0.1") == "127.0.0.1"
+    assert "PRAISONAI_LAUNCH_AUTH_TOKEN" not in os.environ
+
+
+def test_bind_guard_non_loopback_keyless_generates_token(monkeypatch, capsys):
+    import praisonaiagents.agent.launch_security as ls
+    from praisonaiagents.agent.launch_security import resolve_launch_host
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(ls, "_GENERATED_TOKEN", None, raising=False)
+    host = resolve_launch_host("0.0.0.0")
+    # Host still honoured (explicit exposure), but now a token is enforced.
+    assert host == "0.0.0.0"
+    token = os.environ.get("PRAISONAI_LAUNCH_AUTH_TOKEN")
+    assert token
+    out = capsys.readouterr().out
+    assert token in out
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+
+
+def test_bind_guard_reuses_generated_token_across_launches(monkeypatch):
+    """A later non-loopback launch must not mint a fresh token and lock out an
+    endpoint already serving with the previously generated one (issue #4083)."""
+    import praisonaiagents.agent.launch_security as ls
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(ls, "_GENERATED_TOKEN", None, raising=False)
+
+    ls.resolve_launch_host("0.0.0.0")
+    first = os.environ.get("PRAISONAI_LAUNCH_AUTH_TOKEN")
+    assert first
+
+    # Second non-loopback launch in the same process reuses the same token.
+    ls.resolve_launch_host("0.0.0.0")
+    assert os.environ.get("PRAISONAI_LAUNCH_AUTH_TOKEN") == first
+
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(ls, "_GENERATED_TOKEN", None, raising=False)
+
+
+def test_bind_guard_preexisting_token_unchanged(monkeypatch):
+    from praisonaiagents.agent.launch_security import resolve_launch_host
+
+    monkeypatch.setenv("PRAISONAI_LAUNCH_AUTH_TOKEN", "preset")
+    assert resolve_launch_host("0.0.0.0") == "0.0.0.0"
+    assert os.environ["PRAISONAI_LAUNCH_AUTH_TOKEN"] == "preset"
+    monkeypatch.delenv("PRAISONAI_LAUNCH_AUTH_TOKEN", raising=False)
+
+
+def test_launch_default_host_is_loopback():
+    """Neither launch path should default to binding all interfaces."""
+    import inspect
+    from praisonaiagents.agent.execution_mixin import ExecutionMixin
+    from praisonaiagents.agents.agents import PraisonAIAgents
+
+    assert inspect.signature(ExecutionMixin.launch).parameters["host"].default == "127.0.0.1"
+    assert inspect.signature(PraisonAIAgents.launch).parameters["host"].default == "127.0.0.1"
+
+
+def test_mentions_reject_outside_workspace(tmp_path):
+    from praisonaiagents.tools.mentions import MentionsParser
+
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    parser = MentionsParser(workspace_path=str(ws))
+    context, _ = parser.process(f"@file:{outside}")
+    assert "outside workspace" in context.lower() or "not allowed" in context.lower()
+
+
+def test_imap_sanitize_rejects_injection():
+    from praisonaiagents.tools.email_tools import _imap_sanitize
+
+    with pytest.raises(ValueError):
+        _imap_sanitize('test"\r\nBAD')
