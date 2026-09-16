@@ -1,0 +1,357 @@
+"""
+Unit tests for BasePlatformAdapter — the inheritable channel adapter base.
+"""
+
+import asyncio
+
+import pytest
+
+from praisonaiagents.bots import (
+    BasePlatformAdapter,
+    PlatformCapabilities,
+    SendResult,
+)
+
+
+class RecordingBot(BasePlatformAdapter):
+    """Minimal adapter that records sends for assertions."""
+
+    capabilities = PlatformCapabilities(
+        max_message_length=20,
+        supports_edit=True,
+        supports_typing=True,
+    )
+
+    def __init__(self, fail_times: int = 0, retry_after=None):
+        self.sends = []
+        self.typing_calls = 0
+        self.connected = False
+        self._fail_times = fail_times
+        self._retry_after = retry_after
+        self._counter = 0
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self.connected = True
+        return True
+
+    async def disconnect(self) -> None:
+        self.connected = False
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            return SendResult(
+                ok=False, chat_id=chat_id, error="rate_limited",
+                retry_after=self._retry_after,
+            )
+        self._counter += 1
+        mid = f"m{self._counter}"
+        self.sends.append((chat_id, content, reply_to))
+        return SendResult(ok=True, message_id=mid, chat_id=chat_id)
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+    async def send_typing(self, chat_id):
+        self.typing_calls += 1
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class TestContract:
+    def test_is_abstract(self):
+        with pytest.raises(TypeError):
+            BasePlatformAdapter()  # type: ignore[abstract]
+
+    def test_default_capabilities(self):
+        class Bare(RecordingBot):
+            capabilities = PlatformCapabilities()
+
+        bot = Bare()
+        assert bot.max_message_length == 4096
+        assert bot.supports_typing is True  # default in descriptor
+        assert bot.supports_edit is False
+
+
+class TestDeliver:
+    def test_single_short_message(self):
+        bot = RecordingBot()
+        res = run(bot.deliver("c1", "hello"))
+        assert res.ok
+        assert res.message_id == "m1"
+        assert bot.sends == [("c1", "hello", None)]
+
+    def test_chunking_long_message(self):
+        bot = RecordingBot()  # max_message_length=20
+        text = "para one here\n\n" + "x" * 45
+        res = run(bot.deliver("c1", text))
+        assert res.ok
+        assert len(res.message_ids) > 1
+        assert all(len(c) <= 20 for _, c, _ in bot.sends)
+
+    def test_reply_to_only_first_chunk(self):
+        bot = RecordingBot()
+        text = "a" * 25 + "\n\n" + "b" * 25
+        run(bot.deliver("c1", text, reply_to="r1"))
+        reply_targets = [r for _, _, r in bot.sends]
+        assert reply_targets[0] == "r1"
+        assert all(r is None for r in reply_targets[1:])
+
+    def test_typing_called_when_supported(self):
+        bot = RecordingBot()
+        run(bot.deliver("c1", "hi"))
+        assert bot.typing_calls == 1
+
+    def test_typing_skipped_when_unsupported(self):
+        class NoTyping(RecordingBot):
+            capabilities = PlatformCapabilities(supports_typing=False)
+
+        bot = NoTyping()
+        run(bot.deliver("c1", "hi"))
+        assert bot.typing_calls == 0
+
+    def test_empty_string_is_noop(self):
+        bot = RecordingBot()
+        res = run(bot.deliver("c1", ""))
+        assert res.ok
+        assert bot.sends == []
+        assert res.message_ids == []
+
+    def test_dict_content_passthrough(self):
+        bot = RecordingBot()
+        payload = {"blocks": [1, 2, 3]}
+        run(bot.deliver("c1", payload))
+        assert bot.sends == [("c1", payload, None)]
+
+
+class TestRetry:
+    def test_retries_then_succeeds(self):
+        bot = RecordingBot(fail_times=2, retry_after=0)
+        res = run(bot.deliver("c1", "hi"))
+        assert res.ok
+        assert res.message_id == "m1"
+
+    def test_gives_up_after_max_retries(self):
+        bot = RecordingBot(fail_times=99, retry_after=0)
+        res = run(bot.deliver("c1", "hi"))
+        assert not res.ok
+        assert res.error == "rate_limited"
+
+    def test_send_exception_is_retried(self):
+        class Flaky(RecordingBot):
+            async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+                self._counter += 1
+                if self._counter == 1:
+                    raise RuntimeError("boom")
+                return SendResult(ok=True, message_id="ok", chat_id=chat_id)
+
+        bot = Flaky()
+        bot.retry_base_delay = 0
+        res = run(bot.deliver("c1", "hi"))
+        assert res.ok and res.message_id == "ok"
+
+
+class TestEditDelete:
+    def test_edit_not_supported_fallback(self):
+        class NoEdit(RecordingBot):
+            capabilities = PlatformCapabilities(supports_edit=False)
+
+        bot = NoEdit()
+        res = run(bot.edit_message("c1", "m1", "new"))
+        assert not res.ok
+        assert res.error == "edit_not_supported"
+
+    def test_delete_default_false(self):
+        bot = RecordingBot()
+        assert run(bot.delete_message("c1", "m1")) is False
+
+    def test_delete_declared_but_unbacked_raises_at_call(self):
+        class ClaimsDelete(RecordingBot):
+            capabilities = PlatformCapabilities(supports_delete=True)
+
+        with pytest.raises(NotImplementedError):
+            run(ClaimsDelete().delete_message("c1", "m1"))
+
+
+class TestCapabilityContract:
+    def test_backing_map_covers_declared_flags(self):
+        from praisonaiagents.bots import CAPABILITY_BACKING
+
+        assert CAPABILITY_BACKING["supports_edit"] == "edit_message"
+        assert CAPABILITY_BACKING["supports_delete"] == "delete_message"
+
+    def test_declared_and_backed_passes(self):
+        from praisonaiagents.bots import (
+            verify_capability_contract,
+            enforce_capability_contract,
+        )
+
+        class Backed(RecordingBot):
+            capabilities = PlatformCapabilities(supports_edit=True)
+
+            async def edit_message(self, chat_id, message_id, content):
+                return SendResult(ok=True, chat_id=chat_id)
+
+        bot = Backed()
+        assert verify_capability_contract(bot) == []
+        enforce_capability_contract(bot)  # does not raise
+
+    def test_declared_but_unbacked_is_reported(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class Unbacked(RecordingBot):
+            capabilities = PlatformCapabilities(
+                supports_edit=True, supports_delete=True
+            )
+
+        violations = verify_capability_contract(Unbacked())
+        assert any("supports_edit" in v for v in violations)
+        assert any("supports_delete" in v for v in violations)
+
+    def test_enforce_raises_capability_contract_error(self):
+        from praisonaiagents.bots import (
+            CapabilityContractError,
+            enforce_capability_contract,
+        )
+
+        class Unbacked(RecordingBot):
+            capabilities = PlatformCapabilities(supports_edit=True)
+
+        with pytest.raises(CapabilityContractError):
+            enforce_capability_contract(Unbacked())
+
+    def test_unset_flags_do_not_require_backing(self):
+        from praisonaiagents.bots import enforce_capability_contract
+
+        class NoClaims(RecordingBot):
+            capabilities = PlatformCapabilities()
+
+        enforce_capability_contract(NoClaims())  # does not raise
+
+    def test_platform_capabilities_property_is_used(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class DictCaps(RecordingBot):
+            capabilities = {"live_edit": True}  # legacy dict, ignored
+
+            @property
+            def platform_capabilities(self):
+                return PlatformCapabilities(supports_edit=True)
+
+        violations = verify_capability_contract(DictCaps())
+        assert any("supports_edit" in v for v in violations)
+
+    def test_non_callable_backing_is_reported(self):
+        from praisonaiagents.bots import verify_capability_contract
+
+        class NoneBacked(RecordingBot):
+            capabilities = PlatformCapabilities(
+                supports_edit=True, supports_delete=True
+            )
+            edit_message = None
+            delete_message = None
+
+        violations = verify_capability_contract(NoneBacked())
+        assert any("supports_edit" in v for v in violations)
+        assert any("supports_delete" in v for v in violations)
+
+    def test_supports_delete_is_appended_positionally(self):
+        # ``supports_delete`` must be the LAST field so external callers using
+        # the previous positional constructor order keep binding each value to
+        # its original meaning (regression for the field-reorder concern).
+        prior_order = PlatformCapabilities(
+            4096,          # max_message_length
+            "codepoints",  # length_unit
+            True,          # supports_edit
+            False,         # supports_typing
+        )
+        assert prior_order.supports_edit is True
+        assert prior_order.supports_typing is False
+        assert prior_order.supports_delete is False
+
+
+class TestFormatting:
+    def test_format_message_identity(self):
+        bot = RecordingBot()
+        assert bot.format_message("abc") == "abc"
+
+    def test_chunk_helper(self):
+        bot = RecordingBot()
+        chunks = bot.chunk("x" * 55)
+        assert all(len(c) <= 20 for c in chunks)
+
+
+class TestSendResult:
+    def test_to_dict(self):
+        r = SendResult(ok=True, message_id="m1", chat_id="c1")
+        d = r.to_dict()
+        assert d["ok"] and d["message_id"] == "m1" and d["chat_id"] == "c1"
+
+    def test_status_closed_union(self):
+        assert SendResult(ok=True, message_id="m1").status == "sent"
+        assert SendResult(ok=False, error="boom").status == "failed"
+        assert SendResult(ok=True, queued=True).status == "queued"
+        assert SendResult(ok=True, duplicate=True).status == "duplicate"
+
+    def test_status_in_to_dict(self):
+        d = SendResult(ok=True, queued=True).to_dict()
+        assert d["status"] == "queued"
+        assert d["queued"] is True and d["duplicate"] is False
+
+
+class QueuingBot(BasePlatformAdapter):
+    """Adapter whose ``send`` reports a non-``sent`` outcome per chunk."""
+
+    capabilities = PlatformCapabilities(max_message_length=20)
+
+    def __init__(self, *, queued=False, duplicate=False):
+        self._queued = queued
+        self._duplicate = duplicate
+        self._counter = 0
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+        self._counter += 1
+        return SendResult(
+            ok=True,
+            message_id=f"m{self._counter}",
+            chat_id=chat_id,
+            queued=self._queued,
+            duplicate=self._duplicate,
+        )
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class TestDeliverAggregatesOutcome:
+    def test_deliver_preserves_queued_single_chunk(self):
+        bot = QueuingBot(queued=True)
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "queued"
+        assert result.queued is True
+
+    def test_deliver_preserves_duplicate_single_chunk(self):
+        bot = QueuingBot(duplicate=True)
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "duplicate"
+        assert result.duplicate is True
+
+    def test_deliver_preserves_queued_multi_chunk(self):
+        bot = QueuingBot(queued=True)
+        long_text = "a" * 25  # exceeds max_message_length=20 → chunked
+        result = asyncio.run(bot.deliver("c1", long_text))
+        assert result.status == "queued"
+        assert len(result.message_ids) >= 2
+
+    def test_deliver_plain_send_still_sent(self):
+        bot = QueuingBot()
+        result = asyncio.run(bot.deliver("c1", "hello"))
+        assert result.status == "sent"

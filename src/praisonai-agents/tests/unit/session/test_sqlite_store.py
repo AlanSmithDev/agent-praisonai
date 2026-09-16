@@ -1,0 +1,422 @@
+"""Tests for indexed cross-session recall (Issue #2927).
+
+Covers:
+- SqliteSessionStore FTS5-backed search returns anchored hits.
+- Anchored discovery bookends (opening/closing) in SessionHit.
+- Automated (high-volume) session demotion in ranking.
+- Lineage-aware dedup collapsing reset/compacted continuations.
+"""
+
+import tempfile
+
+import pytest
+
+from praisonaiagents.session.store import DefaultSessionStore
+from praisonaiagents.session import SqliteSessionStore
+
+
+@pytest.fixture
+def tmp_dir():
+    with tempfile.TemporaryDirectory() as d:
+        yield d
+
+
+def _seed(store, session_id, messages, **top):
+    from praisonaiagents.session.store import SessionData, SessionMessage
+
+    session = SessionData(session_id=session_id)
+    for role, content in messages:
+        session.messages.append(SessionMessage(role=role, content=content))
+    for k, v in top.items():
+        setattr(session, k, v) if hasattr(session, k) else session.metadata.update({k: v})
+    store._save_session(session)
+
+
+class TestSqliteSessionStore:
+    def test_import_and_construct(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir, db_path=":memory:")
+        assert isinstance(store, DefaultSessionStore)
+
+    def test_search_finds_session(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("s1", "user", "Please help with the billing migration")
+        store.add_message("s1", "assistant", "Sure, migrating billing now")
+        store.add_message("s2", "user", "unrelated weather chat")
+
+        hits = store.search("billing migration")
+        assert len(hits) == 1
+        assert hits[0].session_id == "s1"
+
+    def test_search_backfills_existing_json(self, tmp_dir):
+        # Write via a plain store first (no index), then open sqlite store.
+        plain = DefaultSessionStore(session_dir=tmp_dir)
+        plain.add_message("old", "user", "legacy topic about kubernetes")
+
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        hits = store.search("kubernetes")
+        assert any(h.session_id == "old" for h in hits)
+
+    def test_anchored_bookends(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        msgs = [
+            ("user", "Goal: fix the deploy pipeline"),
+            ("assistant", "Looking into the pipeline"),
+            ("user", "the special keyword marker is here"),
+            ("assistant", "Found the issue"),
+            ("user", "Great, resolved now"),
+        ]
+        for role, content in msgs:
+            store.add_message("b1", role, content)
+
+        hits = store.search("keyword marker")
+        assert hits
+        bookends = hits[0].bookends
+        assert bookends.get("opening")
+        assert "Goal" in bookends["opening"][0]["content"]
+        assert bookends.get("closing")
+        assert "resolved" in bookends["closing"][-1]["content"]
+
+    def test_delete_removes_from_index(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("d1", "user", "quantum entanglement notes")
+        assert store.search("quantum")
+        store.delete_session("d1")
+        assert not store.search("quantum")
+
+    def test_partial_index_still_backfills_legacy_json(self, tmp_dir):
+        # Legacy JSON written before any indexing.
+        plain = DefaultSessionStore(session_dir=tmp_dir)
+        plain.add_message("legacy", "user", "legacy topic about terraform")
+
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        # Index a brand-new session first -> index is now non-empty. A COUNT==0
+        # backfill guard would permanently skip the legacy JSON.
+        store.add_message("fresh", "user", "brand new terraform note")
+
+        hits = store.search("terraform")
+        ids = {h.session_id for h in hits}
+        assert "legacy" in ids
+        assert "fresh" in ids
+
+    def test_transcript_replacement_refreshes_index(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("r1", "user", "original content about pelicans")
+        assert store.search("pelicans")
+
+        # Replace the whole transcript via set_chat_history (goes through
+        # _modify_session_locked, NOT _save_session).
+        store.set_chat_history(
+            "r1", [{"role": "user", "content": "replaced content about narwhals"}]
+        )
+        # Stale term must be gone; new term must be found.
+        assert not store.search("pelicans")
+        assert store.search("narwhals")
+
+    def test_sibling_sessions_not_over_deduped(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        # Two independent children forked from the same parent -> distinct
+        # conversations, must both surface (parent_session_id is not a chain id).
+        _seed(
+            store,
+            "childA",
+            [("user", "sibling recall topic alpha branch")],
+            parent_session_id="P1",
+        )
+        _seed(
+            store,
+            "childB",
+            [("user", "sibling recall topic beta branch")],
+            parent_session_id="P1",
+        )
+        hits = store.search("sibling recall topic")
+        ids = {h.session_id for h in hits}
+        assert ids == {"childA", "childB"}
+
+
+class TestDefaultStoreSearchEnhancements:
+    def test_bookends_present(self, tmp_dir):
+        store = DefaultSessionStore(session_dir=tmp_dir)
+        for role, content in [
+            ("user", "opening goal about invoices"),
+            ("assistant", "ok"),
+            ("user", "the invoices magic-token detail"),
+            ("assistant", "done"),
+            ("user", "closing outcome invoices"),
+        ]:
+            store.add_message("x1", role, content)
+        hits = store.search("magic-token")
+        assert hits
+        assert hits[0].bookends.get("opening")
+
+    def test_automated_session_demoted(self, tmp_dir):
+        store = DefaultSessionStore(session_dir=tmp_dir)
+        # Interactive session with the term once.
+        store.add_message("human", "user", "need the report summary")
+        # Automated/scheduled session tagged as such, also contains the term.
+        _seed(
+            store,
+            "cron",
+            [("assistant", "scheduled report summary run")],
+            source="scheduled",
+        )
+        hits = store.search("report summary")
+        ids = [h.session_id for h in hits]
+        assert ids[0] == "human"
+
+    def test_lineage_dedup(self, tmp_dir):
+        store = DefaultSessionStore(session_dir=tmp_dir)
+        _seed(
+            store,
+            "root",
+            [("user", "migration lineage topic root")],
+            lineage_id="L1",
+        )
+        _seed(
+            store,
+            "continuation",
+            [("user", "migration lineage topic continued")],
+            lineage_id="L1",
+        )
+        hits = store.search("lineage topic")
+        # Both belong to lineage L1 -> collapse to a single hit.
+        assert len(hits) == 1
+
+    def test_backward_compatible_hit_dict(self, tmp_dir):
+        store = DefaultSessionStore(session_dir=tmp_dir)
+        store.add_message("c1", "user", "hello world unique-term")
+        hits = store.search("unique-term")
+        d = hits[0].as_dict()
+        assert d["session_id"] == "c1"
+        assert "messages" in d
+
+
+class TestArchivedRecall:
+    """Issue #5031: compaction must not silently drop turns from recall.
+
+    A conversation compacted under ``retention="compact"`` moves its raw turns
+    into ``archived_messages``; recall must still span the whole conversation,
+    and both built-in stores must agree so their recall can't drift.
+    """
+
+    def _seed_with_archive(self, store, session_id, archived, active):
+        from praisonaiagents.session.store import SessionData, SessionMessage
+
+        session = SessionData(session_id=session_id)
+        for role, content in archived:
+            session.archived_messages.append(
+                SessionMessage(role=role, content=content)
+            )
+        for role, content in active:
+            session.messages.append(SessionMessage(role=role, content=content))
+        store._save_session(session)
+
+    def test_default_store_recalls_archived_turn(self, tmp_dir):
+        store = DefaultSessionStore(session_dir=tmp_dir)
+        self._seed_with_archive(
+            store,
+            "s1",
+            archived=[("user", "the special value was zx-9271-alpha")],
+            active=[("system", "Summary: helped set up X")],
+        )
+        hits = store.search("zx-9271-alpha")
+        assert len(hits) == 1
+        assert hits[0].session_id == "s1"
+        # The anchoring context marks the compaction boundary.
+        assert any(m.get("archived") for m in hits[0].messages)
+
+    def test_sqlite_store_recalls_archived_turn(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        self._seed_with_archive(
+            store,
+            "s1",
+            archived=[("user", "the special value was zx-9271-alpha")],
+            active=[("system", "Summary: helped set up X")],
+        )
+        hits = store.search("zx-9271-alpha")
+        assert len(hits) == 1
+        assert hits[0].session_id == "s1"
+        assert any(m.get("archived") for m in hits[0].messages)
+
+    def test_both_stores_agree_on_archived_only_query(self, tmp_dir):
+        default = DefaultSessionStore(session_dir=tmp_dir)
+        self._seed_with_archive(
+            default,
+            "s1",
+            archived=[("user", "the special value was zx-9271-alpha")],
+            active=[("system", "Summary: helped set up X")],
+        )
+        indexed = SqliteSessionStore(session_dir=tmp_dir)
+
+        default_ids = [h.session_id for h in default.search("zx-9271-alpha")]
+        indexed_ids = [h.session_id for h in indexed.search("zx-9271-alpha")]
+        assert default_ids == indexed_ids == ["s1"]
+
+    def test_real_compaction_stays_searchable(self, tmp_dir):
+        # Drive an actual compaction: the early turn is rolled into the archive
+        # and must remain recallable afterwards.
+        store = DefaultSessionStore(session_dir=tmp_dir, active_window=3)
+        store.add_message("s", "user", "the special value was zx-9271-alpha")
+        for i in range(8):
+            store.add_message("s", "user", f"later message {i}")
+
+        session = store.get_session("s")
+        archived = [m.content for m in session.archived_messages]
+        assert "the special value was zx-9271-alpha" in archived
+
+        hits = store.search("zx-9271-alpha")
+        assert [h.session_id for h in hits] == ["s"]
+
+    def test_window_scrolls_from_archived_anchor(self, tmp_dir):
+        # The anchor returned by search indexes the archived+active projection;
+        # window must scroll the SAME projection so an archived hit resolves to
+        # the matching turn, not an unrelated recent one (Qodo High).
+        for store in (
+            DefaultSessionStore(session_dir=tmp_dir + "/d"),
+            SqliteSessionStore(session_dir=tmp_dir + "/s"),
+        ):
+            self._seed_with_archive(
+                store,
+                "s1",
+                archived=[
+                    ("user", "the special value was zx-9271-alpha"),
+                    ("assistant", "noted the special value"),
+                ],
+                active=[
+                    ("system", "Summary: helped set up X"),
+                    ("user", "unrelated recent turn one"),
+                    ("user", "unrelated recent turn two"),
+                ],
+            )
+            hits = store.search("zx-9271-alpha")
+            assert hits and hits[0].session_id == "s1"
+            anchor = hits[0].anchor_index
+            rows = store.window("s1", str(anchor), window=1)
+            contents = " ".join(r["content"] for r in rows)
+            assert "zx-9271-alpha" in contents
+            assert any(r.get("archived") for r in rows)
+
+    def test_existing_index_migrated_for_archived_recall(self, tmp_dir):
+        # Upgrade path: a store populated by a prior release indexed active
+        # messages only. Opening it with the archived-aware implementation must
+        # force a one-time content reindex so an archived-only query succeeds
+        # WITHOUT another session write (Qodo/Greptile High).
+        import os
+
+        db_path = os.path.join(tmp_dir, "sessions_index.db")
+        store = SqliteSessionStore(session_dir=tmp_dir, db_path=db_path)
+        self._seed_with_archive(
+            store,
+            "old",
+            archived=[("user", "the special value was zx-9271-alpha")],
+            active=[("system", "Summary: helped set up X")],
+        )
+        # Simulate a v1 (active-only) index: rewrite the FTS content without the
+        # archived turn and reset the version marker to the pre-archived state.
+        conn = store._connect()
+        store._ensure_backfilled()
+        with store._db_lock:
+            conn.execute("DELETE FROM session_fts WHERE session_id = ?", ("old",))
+            conn.execute(
+                "INSERT INTO session_fts (session_id, content) VALUES (?, ?)",
+                ("old", "Summary: helped set up X"),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO session_index_meta (key, value) "
+                "VALUES ('content_version', '1')",
+            )
+        # A pre-migration query for the archived-only token must miss.
+        assert not store._candidate_ids("zx-9271-alpha", 5)
+
+        # Re-open fresh against the same DB/dir: migration force-reindexes.
+        reopened = SqliteSessionStore(session_dir=tmp_dir, db_path=db_path)
+        hits = reopened.search("zx-9271-alpha")
+        assert [h.session_id for h in hits] == ["old"]
+
+
+class TestIndexedSessionRoute:
+    """Indexed gateway/agent routing lookups (Issue #2956)."""
+
+    def test_get_by_gateway_session_indexed(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("s1", "user", "hi")
+        store.set_gateway_info("s1", gateway_session_id="gw-1", agent_id="a-1")
+
+        found = store.get_by_gateway_session("gw-1")
+        assert found is not None
+        assert found.session_id == "s1"
+        assert store.get_by_gateway_session("missing") is None
+
+    def test_get_by_gateway_session_no_scan(self, tmp_dir, monkeypatch):
+        # An indexed lookup must not fall back to an os.listdir scan.
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("s1", "user", "hi")
+        store.set_gateway_info("s1", gateway_session_id="gw-1")
+        store._ensure_backfilled()
+
+        import praisonaiagents.session.store as store_mod
+
+        def _boom(*_a, **_k):
+            raise AssertionError("os.listdir must not be called on the hot path")
+
+        monkeypatch.setattr(store_mod.os, "listdir", _boom)
+        found = store.get_by_gateway_session("gw-1")
+        assert found is not None and found.session_id == "s1"
+
+    def test_list_sessions_by_gateway_agent_indexed(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        for sid in ("s1", "s2", "s3"):
+            store.add_message(sid, "user", "hi")
+        store.set_gateway_info("s1", agent_id="a-1")
+        store.set_gateway_info("s2", agent_id="a-1")
+        store.set_gateway_info("s3", agent_id="a-2")
+
+        ids = store.list_sessions_by_gateway_agent("a-1")
+        assert set(ids) == {"s1", "s2"}
+        assert store.list_sessions_by_gateway_agent("a-2") == ["s3"]
+
+    def test_route_backfills_existing_json(self, tmp_dir):
+        # Session with gateway info written via a plain store (no index).
+        plain = DefaultSessionStore(session_dir=tmp_dir)
+        plain.add_message("old", "user", "legacy")
+        plain.set_gateway_info("old", gateway_session_id="gw-old", agent_id="a-old")
+
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        found = store.get_by_gateway_session("gw-old")
+        assert found is not None and found.session_id == "old"
+        assert store.list_sessions_by_gateway_agent("a-old") == ["old"]
+
+    def test_route_cleared_on_delete(self, tmp_dir):
+        store = SqliteSessionStore(session_dir=tmp_dir)
+        store.add_message("s1", "user", "hi")
+        store.set_gateway_info("s1", gateway_session_id="gw-1")
+        assert store.get_by_gateway_session("gw-1") is not None
+
+        store.delete_session("s1")
+        assert store.get_by_gateway_session("gw-1") is None
+
+    def test_route_backfills_content_indexed_but_unrouted(self, tmp_dir):
+        # Migration case: a store upgraded from a prior release already has the
+        # content index (session_meta) populated for a gateway session, but the
+        # newly-created session_route table is empty. Backfill must still create
+        # the route row on first read so gateway routing does not silently lose
+        # the session (Greptile P1 regression).
+        import os
+
+        db_path = os.path.join(tmp_dir, "sessions_index.db")
+        store = SqliteSessionStore(session_dir=tmp_dir, db_path=db_path)
+        store.add_message("old", "user", "legacy topic")
+        store.set_gateway_info("old", gateway_session_id="gw-old", agent_id="a-old")
+
+        # Simulate an old on-disk index: content indexed, route table empty.
+        conn = store._connect()
+        conn.execute("DELETE FROM session_route")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM session_meta WHERE session_id = ?", ("old",)
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM session_route").fetchone()[0] == 0
+
+        # Re-open the store fresh (new backfill state) against the same DB/dir.
+        reopened = SqliteSessionStore(session_dir=tmp_dir, db_path=db_path)
+        found = reopened.get_by_gateway_session("gw-old")
+        assert found is not None and found.session_id == "old"
+        assert reopened.list_sessions_by_gateway_agent("a-old") == ["old"]

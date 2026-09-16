@@ -1,0 +1,265 @@
+/**
+ * What a tap means.
+ *
+ * Approval prompts were being rendered and could not be answered: the buttons
+ * carried their ids and nothing listened. The run then blocks until the
+ * engine's timeout with a correct-looking screen — so these cases are mostly
+ * about taps that are easy to get wrong rather than the happy path.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { intentFrom, type Actionable } from "./intents.ts";
+
+const el = (dataset: Record<string, string | undefined>, disabled?: boolean): Actionable =>
+  disabled === undefined ? { dataset } : { dataset, disabled };
+
+test("an approval button resolves to its approvalId and choice", () => {
+  const intent = intentFrom([el({ approvalId: "ap1", choice: "allow" })]);
+  assert.deepEqual(intent, { kind: "approve", approvalId: "ap1", choice: "allow" });
+});
+
+test("a tap on the label INSIDE a button still resolves", () => {
+  // What every real tap looks like: the finger lands on the text, not the
+  // control. A naive event.target check misses exactly the taps users make.
+  const intent = intentFrom([
+    el({}),                                       // the <span> that was tapped
+    el({ approvalId: "ap1", choice: "deny" }),    // the button around it
+  ]);
+  assert.deepEqual(intent, { kind: "approve", approvalId: "ap1", choice: "deny" });
+});
+
+test("a disabled control does nothing", () => {
+  // Approval buttons go disabled while a decision is in flight. Honouring that
+  // here is what stops a double tap sending two decisions for one prompt.
+  assert.equal(intentFrom([el({ approvalId: "ap1", choice: "allow" }, true)]), null);
+});
+
+test("a disabled ancestor blocks a tap on its child", () => {
+  // Otherwise the walk skips past the disabled button and finds something
+  // actionable further out, which is worse than doing nothing.
+  assert.equal(intentFrom([el({}), el({ approvalId: "ap1", choice: "allow" }, true)]), null);
+});
+
+test("an unrecognised choice is refused rather than coerced", () => {
+  // Sending a decision the engine cannot parse leaves the run blocked exactly
+  // as not sending does — but refusing here is visible.
+  assert.equal(intentFrom([el({ approvalId: "ap1", choice: "maybe" })]), null);
+});
+
+test("all three real choices are accepted", () => {
+  // The pair: "refuse everything" would satisfy the two tests above and no
+  // approval could ever be answered.
+  for (const choice of ["allow", "always", "deny"] as const) {
+    assert.deepEqual(
+      intentFrom([el({ approvalId: "a", choice })]),
+      { kind: "approve", approvalId: "a", choice },
+    );
+  }
+});
+
+test("an approval with no choice is not an approval", () => {
+  assert.equal(intentFrom([el({ approvalId: "ap1" })]), null);
+});
+
+test("a choice with no approvalId is not an approval", () => {
+  // The id is what goes back on the wire. Without it there is nothing to send,
+  // and guessing from position is the bug the whole approvalId design prevents.
+  assert.equal(intentFrom([el({ choice: "allow" })]), null);
+});
+
+test("the plain actions resolve", () => {
+  assert.deepEqual(intentFrom([el({ action: "send" })]), { kind: "send" });
+  assert.deepEqual(intentFrom([el({ action: "stop" })]), { kind: "stop" });
+  assert.deepEqual(intentFrom([el({ action: "new-chat" })]), { kind: "new-chat" });
+  assert.deepEqual(intentFrom([el({ action: "retry" })]), { kind: "retry" });
+  assert.deepEqual(intentFrom([el({ action: "copy" })]), { kind: "copy" });
+});
+
+test("opening a chat carries the chat id", () => {
+  assert.deepEqual(intentFrom([el({ action: "open-chat", chatId: "c1" })]),
+    { kind: "open-chat", chatId: "c1" });
+});
+
+test("an open-chat with no id does nothing rather than opening something else", () => {
+  // A row whose id went missing must not fall through to the row behind it.
+  assert.equal(intentFrom([el({ action: "open-chat" })]), null);
+});
+
+test("deleting a chat carries the chat id", () => {
+  assert.deepEqual(intentFrom([el({ action: "delete-chat", chatId: "c9" })]),
+    { kind: "delete-chat", chatId: "c9" });
+});
+
+test("an unknown action stops the walk rather than resolving to something else", () => {
+  // A newer template can carry an action this build has never heard of. Doing
+  // nothing is correct; silently performing the enclosing row's action is not
+  // -- that is how a tap on an unknown control deletes a chat.
+  const intent = intentFrom([
+    el({ action: "future-thing" }),
+    el({ action: "delete-chat", chatId: "c1" }),
+  ]);
+  assert.equal(intent, null);
+});
+
+test("a tap on nothing actionable resolves to nothing", () => {
+  assert.equal(intentFrom([el({}), el({}), el({})]), null);
+});
+
+test("an empty chain resolves to nothing", () => {
+  assert.equal(intentFrom([]), null);
+});
+
+test("the innermost actionable ancestor wins", () => {
+  // A delete button inside a chat row: the tap deletes, it does not open.
+  const intent = intentFrom([
+    el({ action: "delete-chat", chatId: "c1" }),
+    el({ action: "open-chat", chatId: "c1" }),
+  ]);
+  assert.deepEqual(intent, { kind: "delete-chat", chatId: "c1" });
+});
+
+test("a DISABLED control fires nothing, and does not fall through to its row", () => {
+  // `if (el.disabled === true) return null` -> `continue` survived. The walk
+  // would skip the disabled element and keep climbing, so a tap on a greyed-out
+  // approval button reaches the enclosing row and fires THAT row's intent.
+  //
+  // This is the only thing standing between a double-tap and a second send,
+  // and between a tap on a decision already in flight and a second decision.
+  const chain = [
+    { dataset: { action: "send" }, disabled: true },
+    { dataset: { action: "stop" }, disabled: false },
+  ];
+  assert.equal(intentFrom(chain), null, "a disabled control must stop the walk, not skip itself");
+});
+
+test("an ENABLED control still resolves through its ancestors", () => {
+  // The pair: returning null unconditionally would disable the whole app.
+  const chain = [
+    { dataset: {}, disabled: false },
+    { dataset: { action: "stop" }, disabled: false },
+  ];
+  assert.deepEqual(intentFrom(chain), { kind: "stop" });
+});
+
+test("a delete-chat with no chat id is refused, not addressed at nothing", () => {
+  // Defaulting to "" produced a delete request aimed at no chat -- or, if any
+  // chat is keyed "", at the wrong one.
+  assert.equal(intentFrom([{ dataset: { action: "delete-chat" }, disabled: false }]), null);
+});
+
+// ---- editing a setting -----------------------------------------------------
+//
+// The recovery path the remote-http default depends on. The settings screen
+// renders real fields, and until now each one committed itself from inside its
+// own `change` listener -- the one affordance in the app that did NOT go
+// through this file. That is the arrangement the header argues against: the
+// decision (which key, what was typed, and whether this element means anything
+// at all) could only be exercised by synthesising events against a DOM.
+
+test("a settings field resolves to a set-setting carrying its key AND what was typed", () => {
+  const intent = intentFrom([
+    { dataset: { action: "set-setting", settingKey: "baseUrl" }, value: "http://10.0.0.7:9000" },
+  ]);
+  assert.deepEqual(intent, { kind: "set-setting", key: "baseUrl", raw: "http://10.0.0.7:9000" });
+});
+
+test("a set-setting with no key is refused rather than aimed at nothing", () => {
+  // Same rule as delete-chat and navigate: an action that needs an id and has
+  // none must not resolve to a write against "" -- `settings.set` refuses an
+  // unknown key, but silently, and the user is told nothing.
+  assert.equal(intentFrom([{ dataset: { action: "set-setting" }, value: "x" }]), null);
+});
+
+test("a set-setting from an element with NO value is refused, not written as empty", () => {
+  // Only a field has a value. A tap that lands on the row's <label> and walks
+  // out to something carrying the action but no text must not be decoded as
+  // "the user cleared this setting" -- that would wipe the engine address on a
+  // stray tap, on the one screen whose job is to repair it.
+  assert.equal(intentFrom([{ dataset: { action: "set-setting", settingKey: "baseUrl" } }]), null);
+});
+
+test("an EMPTIED field is still a real edit, and decodes as an empty string", () => {
+  // The pair for the test above: `value: ""` is a person clearing a field, and
+  // refusing it too would make "" indistinguishable from "no field here" and
+  // leave a cleared setting silently ignored. Where the empty string is not a
+  // legal value, validateInput is what refuses it -- visibly.
+  assert.deepEqual(
+    intentFrom([{ dataset: { action: "set-setting", settingKey: "baseUrl" }, value: "" }]),
+    { kind: "set-setting", key: "baseUrl", raw: "" },
+  );
+});
+
+test("a DISABLED settings field commits nothing", () => {
+  // A field goes disabled while a write is in flight; honouring that is what
+  // stops a second commit racing the first to the store.
+  assert.equal(
+    intentFrom([
+      { dataset: { action: "set-setting", settingKey: "baseUrl" }, value: "x", disabled: true },
+    ]),
+    null,
+  );
+});
+
+// ---- secrets are their own intent -------------------------------------------
+
+test("a committed secret field decodes as set-secret, not as set-setting", () => {
+  // The split is the whole safeguard. A secret goes to SecretsPort through
+  // `setSecret`; a plain value goes to StoragePort through `set`. One shared
+  // intent carrying a boolean is a single code path that decides at runtime
+  // which store a value lands in -- and getting that boolean wrong once puts
+  // an API key in a plaintext settings file, which is the failure store.ts
+  // quotes from engine/server.py:653.
+  assert.deepEqual(
+    intentFrom([{ dataset: { action: "set-secret", settingKey: "openaiApiKey" }, value: "sk-abc" }]),
+    { kind: "set-secret", key: "openaiApiKey", raw: "sk-abc" },
+  );
+});
+
+test("a set-secret with no key is refused rather than aimed at nothing", () => {
+  assert.equal(intentFrom([{ dataset: { action: "set-secret" }, value: "sk-abc" }]), null);
+});
+
+test("a set-secret from an element with NO value is refused", () => {
+  // A tap that lands on the row and walks out to the action without a field
+  // must not read as "the user cleared their key".
+  assert.equal(intentFrom([{ dataset: { action: "set-secret", settingKey: "openaiApiKey" } }]), null);
+});
+
+test("an EMPTY secret commit is refused -- unlike an empty plain setting", () => {
+  // Deliberately the OPPOSITE of `set-setting`, where "" is a real edit. The
+  // secret field renders empty on every paint, so a blank commit is far more
+  // likely to be a stray blur than a decision -- and the decision it would be
+  // mistaken for is "destroy the credential". Removing a key is `clear-secret`,
+  // which the user reaches by pressing a button that says so.
+  for (const raw of ["", "   ", "\n"]) {
+    assert.equal(
+      intentFrom([{ dataset: { action: "set-secret", settingKey: "openaiApiKey" }, value: raw }]),
+      null,
+      `an empty commit (${JSON.stringify(raw)}) must not reach the keychain`,
+    );
+  }
+});
+
+test("the Remove button decodes as clear-secret, and needs no value", () => {
+  // A button holds nothing, so requiring a value here would make the control
+  // permanently inert -- and a key that can be entered but never removed
+  // leaves "no key configured" a state the user can never get back to.
+  assert.deepEqual(
+    intentFrom([{ dataset: { action: "clear-secret", settingKey: "openaiApiKey" } }]),
+    { kind: "clear-secret", key: "openaiApiKey" },
+  );
+});
+
+test("a clear-secret with no key is refused", () => {
+  assert.equal(intentFrom([{ dataset: { action: "clear-secret" } }]), null);
+});
+
+test("a DISABLED secret control commits nothing", () => {
+  assert.equal(
+    intentFrom([
+      { dataset: { action: "set-secret", settingKey: "openaiApiKey" }, value: "sk-abc", disabled: true },
+    ]),
+    null,
+  );
+});
